@@ -1,0 +1,21 @@
+# 统一换行符，避免在不同机器/系统上 clone 之后脚本坏掉。
+#
+# 为什么重要：cmd.exe 解析 .bat 时对"裸 LF"很敏感 —— 我们踩过这个坑，
+# 一个 LF 结尾的 .bat 会报 "The system cannot find the batch label specified"。
+# 所以 .bat 一律以 CRLF 检出。
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.txt  text eol=lf
+
+# 图片与权重属于二进制
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.pkl  binary
+*.pt   binary
+*.pth  binary

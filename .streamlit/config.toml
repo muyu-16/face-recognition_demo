@@ -1,0 +1,27 @@
+# Streamlit 配置文件（放在项目下的 .streamlit 目录里，随项目生效）
+
+[theme]
+base = "light"
+primaryColor = "#2E7D32"
+
+[browser]
+# 关闭匿名使用数据统计
+gatherUsageStats = false
+
+[server]
+# 单次上传文件大小上限（MB），注册时可能需要一次传多张图
+maxUploadSize = 100
+# 关闭首次运行时索要邮箱的 "Welcome to Streamlit!" 提示
+# （1.65 由这个选项控制；置为 false 后不会再问，也不用去动 ~/.streamlit/credentials.toml）
+showEmailPrompt = false
+
+[logger]
+# 关闭启动横幅，以及界面上那个"给 AI 助手安装 Streamlit 技能包"的推广提示
+# （它想往 ~/.agents 写文件，在部分机器上会因用户目录权限报 WinError 5；
+#   源码 streamlit/web/skills.py 判断该选项为 true 时就不再弹这个提示）
+hideWelcomeMessage = true
+
+[client]
+# 摄像头/上传的提示语是否显示
+showErrorDetails = true
+toolbarMode = "auto"

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 人脸库与注册图片属于运行时数据，不建议提交到仓库
+face_db.pkl
+face_db.bak.pkl
+face_db.pkl.tmp
+*.corrupt-*.pkl
+registered_faces/
+
+# 自检 / 调试产物
+.selftest*/
+detect_preview.png
+.tmp_netcheck/
+.tmptest/
+torchinductor_*/
+
+
+# 预训练权重缓存（当 ~/.cache 不可写时，程序会自动改用项目内的 .cache/torch）
+.cache/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 启动脚本调试输出
+*.launch_*.txt
+.launch_*.txt
