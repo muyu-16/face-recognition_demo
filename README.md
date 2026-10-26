@@ -89,10 +89,11 @@ pip install -r requirements.txt
 
 ### 方式 C：一键脚本（Windows 偷懒法）
 
-直接双击 **`run.bat`**：它会自动识别 `uv` 或 `py 3.10~3.12`、建虚拟环境、装依赖、跑自检、启动界面。
-只想看看它会做什么而不真的安装：`run.bat --dry-run`。
+直接双击 **`start.bat`**：它会自动识别 `uv` 或 `py 3.10~3.12`，判断环境是否就绪，
+缺什么就自动补齐（建虚拟环境 → 装依赖 → 下权重 → 自检），然后启动网页。
+只想看看它会做什么而不真的安装：`start.bat --dry-run`。
 
-> `run.bat` 内部刻意只用 ASCII 英文提示：cmd.exe 按系统 OEM 代码页解析 .bat 文件，
+> `start.bat` 内部刻意只用 ASCII 英文提示：cmd.exe 按系统 OEM 代码页解析 .bat 文件，
 > UTF-8 中文会被解码错乱，导致 `&&`、引号等被吃坏、脚本直接崩掉（这是实测踩过的坑）。
 
 ### （可选）安装 GPU 版 PyTorch
@@ -116,22 +117,21 @@ streamlit run app.py
 
 浏览器会自动打开 <http://localhost:8501>（若没自动打开，手动访问即可）。
 
-### Windows 上最快的启动方式（双击 `run.bat`）
+### Windows 上最快的启动方式（双击 `start.bat`）
 
 | 脚本 | 什么时候用 | 它会做什么 |
 | --- | --- | --- |
-| **`run.bat`** | **第一次 / 换电脑 / 环境坏了 / 平时都行（推荐）** | **一键全自动**：挑解释器 → 建 `.venv` → 装依赖（清华镜像优先）→ 预下载模型权重 → 跑自检 → 启动网页 |
-| `start.bat` | 日常秒开 | 只检查环境，**缺什么就自动调 `run.bat` 补齐**，然后启动；环境已就绪时 2 秒进界面 |
+| **`start.bat`** | **任何时候（新手首选）** | **一个入口全自动**：挑解释器 → 判断环境 → 缺啥补啥（建 `.venv` / 装依赖 / 下权重 / 自检）→ 启动网页 |
 
-双击即可。想让桌面随时能点，右键 `run.bat` → **发送到 → 桌面快捷方式**；
+双击即可。想让桌面随时能点，右键 `start.bat` → **发送到 → 桌面快捷方式**；
 脚本内部会自己 `cd` 到所在目录，所以快捷方式放到哪都能正确启动。
 
 ```bat
-run.bat                  :: 一键：配置环境 + 自检 + 启动
-run.bat --setup-only     :: 只配置环境，不启动
-run.bat --skip-test      :: 跳过自检，配置完直接启动
-run.bat --dry-run        :: 只报告将要执行的命令，什么都不改
-start.bat --check        :: 启动前额外跑一遍自检
+start.bat                  :: 一键：自动配置 + 启动（新手就用这个）
+start.bat --check          :: 启动前强制跑一遍自检
+start.bat --setup          :: 强制重新检查/安装依赖
+start.bat --no-browser     :: 启动但不自动打开浏览器
+start.bat --dry-run        :: 只报告将要执行的命令，什么都不改
 ```
 
 > 📖 **完整的环境配置与排错手册见 [启动说明.md](启动说明.md)**：
@@ -149,7 +149,7 @@ start.bat --check        :: 启动前额外跑一遍自检
 > （在没装依赖的解释器下还会直接报 `ModuleNotFoundError: No module named 'numpy'`）。
 > `app.py` 现在会主动检测这两种情况并打印中文提示。
 
-首次运行会下载权重（`run.bat` 的 `[4/6]` 步骤会提前下好，约 150 MB），之后有缓存就不再下载。
+首次运行会下载权重（`start.bat` 的 `[4/6]` 步骤会提前下好，约 150 MB），之后有缓存就不再下载。
 
 ### 先跑一遍自检（推荐）
 
@@ -412,8 +412,7 @@ uv pip install --python .venv\Scripts\python.exe streamlit-webrtc av   # 本项�
 ├── self_test.py           # 一键自检脚本（环境 / 数学 / 人脸库 / 模型 / 端到端）
 ├── requirements.txt       # 依赖清单
 ├── README.md              # 本文件
-├── run.bat                # Windows 一键安装并启动（首次使用）
-├── start.bat              # Windows 快速启动（日常秒开，跳过安装与自检）
+├── start.bat              # Windows 一键启动（唯一入口，新手双击这个）
 ├── .streamlit/config.toml # Streamlit 主题与上传大小等配置
 ├── face_db.pkl            # 【自动生成】人脸库（姓名 + 特征 + 元数据）
 ├── face_db.bak.pkl        # 【自动生成】上一次保存的自动备份
@@ -546,7 +545,7 @@ uv pip install -r requirements.txt
   用 `uv venv` 建环境、`uv pip install` 装包即可（uv 自带解析器，不依赖 venv 里的 pip）。
 
 > 另外，裸 `python` 有时会命中 `WindowsApps` 里的**商店占位程序**（执行后毫无反应或弹出应用商店）。
-> `run.bat` 因此优先使用 `py -3.11` 这类启动器，而不是裸 `python`。
+> `start.bat` 因此优先使用 `py -3.11` 这类启动器，而不是裸 `python`。
 
 **Q1：首次运行报"预训练模型加载失败 / 下载超时"？**
 需要联网下载权重（InceptionResnetV1 约 110 MB）。可手动下载后放到缓存目录：

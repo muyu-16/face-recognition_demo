@@ -100,7 +100,7 @@ def test_environment() -> dict:
     else:
         record(SKIP, "当前解释器不在虚拟环境中",
                "若下面报缺 torch / streamlit / Pillow，多半就是用了全局 Python 而不是 .venv 里的那个；"
-               "请改成执行 .venv\\Scripts\\python.exe self_test.py，或直接双击 run.bat")
+               "请改成执行 .venv\\Scripts\\python.exe self_test.py，或直接双击 start.bat")
 
     def _try_import(module_name: str, label: str) -> Optional[str]:
         try:

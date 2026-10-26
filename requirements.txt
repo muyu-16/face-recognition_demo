@@ -6,14 +6,15 @@
 
 # ---------- 必做功能所需 ----------
 # 深度学习框架。默认安装的是 CPU 版；有 NVIDIA 显卡想用 GPU，请按 README 换成 CUDA 版
-torch>=2.0.0
-torchvision>=0.15.0
+# 提示：给 torch 加了 <3.0 上限，避免未来拉到 3.x 破坏性大版本导致与 facenet-pytorch 不兼容
+torch>=2.0.0,<3.0
+torchvision>=0.15.0,<1.0
 
 # 人脸检测 MTCNN + 特征提取 InceptionResnetV1（Timesler 的实现）
 facenet-pytorch>=2.5.3
 
 # 数值计算与图像处理
-numpy>=1.24
+numpy>=1.24,<3.0
 Pillow>=9.5
 
 # 界面框架

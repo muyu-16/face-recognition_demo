@@ -74,7 +74,7 @@ def _check_run_environment() -> None:
         print("   国内网络慢可以加镜像：")
         print("       pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple")
         print()
-        print("   或者直接双击项目里的 run.bat（自动建环境 + 装依赖 + 自检 + 启动）。")
+        print("   或者直接双击项目里的 start.bat（自动建环境 + 装依赖 + 自检 + 启动）。")
         print("=" * 72)
         raise SystemExit(1)
 
@@ -97,7 +97,7 @@ def _check_run_environment() -> None:
         print("   正确命令（在项目根目录执行）：")
         print("       streamlit run app.py")
         print()
-        print("   或者双击 run.bat。")
+        print("   或者双击 start.bat。")
         print("   说明：python app.py 只是执行了一遍脚本，没有启动 Web 服务器，")
         print("         因此既不会有界面，也不会有任何输出。")
         print("=" * 72)
@@ -1329,7 +1329,7 @@ def render_about_tab(cfg: Dict[str, object], detector: FaceDetector,
 ├── self_test.py           # 一键自检脚本（环境 / 数学 / 模型 / 端到端）
 ├── requirements.txt       # 依赖清单
 ├── README.md              # 安装、运行与说明文档
-├── run.bat                # Windows 一键安装并启动脚本
+├── start.bat              # Windows 一键安装并启动脚本
 ├── face_db.pkl            # 【自动生成】人脸库特征文件
 └── registered_faces/      # 【自动生成】注册时保存的人脸小图""",
         language="text",

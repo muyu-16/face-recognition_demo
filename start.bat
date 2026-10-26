@@ -1,23 +1,27 @@
 @echo off
 rem ===========================================================================
-rem  Face Recognition Demo - ONE CLICK start (Windows)
+rem  Face Recognition Demo - ONE CLICK launch (Windows)
 rem
-rem  Just double-click this file. It will:
-rem    1. look for a usable Python / uv toolchain
-rem    2. create the virtual environment .venv when it is missing
-rem    3. install everything listed in requirements.txt (mirror first)
-rem    4. pre-download the pretrained model weights (about 150 MB, first run)
-rem    5. start the web UI on http://localhost:8501
+rem  This is THE ONLY file a beginner needs. Double-click it.
 rem
-rem  NOTE: this file is intentionally ASCII-only. cmd.exe parses .bat files with
-rem        the system OEM code page, so UTF-8 Chinese text here would break it.
-rem        Chinese documentation: README.md and the file "????.md".
+rem  What it does, automatically:
+rem    1. finds a usable toolchain (uv, or Python 3.10~3.12)
+rem    2. creates the virtual environment .venv if missing / broken
+rem    3. installs requirements.txt if anything is missing (mirror first)
+rem    4. pre-downloads the pretrained model weights (~150 MB, first run only)
+rem    5. runs the self test (skipped automatically once the env is healthy)
+rem    6. starts the web UI and opens http://localhost:8501 in your browser
 rem
-rem  Usage:
-rem      start.bat             one click: setup (only if needed) + launch
-rem      start.bat --check     also run self_test.py before launching
-rem      start.bat --setup     force a dependency check / reinstall
-rem      start.bat --dry-run   report what would be done, change nothing
+rem  Advanced flags (optional, for power users):
+rem      start.bat --check       always run self_test.py before launching
+rem      start.bat --setup       force a dependency re-check / reinstall
+rem      start.bat --no-browser  do not auto-open the browser
+rem      start.bat --dry-run     report what would be done, change nothing
+rem
+rem  NOTE: this file is intentionally ASCII-only. cmd.exe parses .bat files
+rem        with the system OEM code page, so UTF-8 Chinese text here would be
+rem        mis-decoded and break the script. Chinese docs: README.md and the
+rem        startup guide (Chinese file name).
 rem ===========================================================================
 chcp 65001 >nul
 setlocal
@@ -26,13 +30,15 @@ cd /d "%~dp0"
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 set "DO_CHECK=0"
 set "FORCE_SETUP=0"
+set "NO_BROWSER=0"
 set "DRY_RUN=0"
 
 :parse_args
 if "%~1"=="" goto :args_done
-if /i "%~1"=="--check" set "DO_CHECK=1"
-if /i "%~1"=="--setup" set "FORCE_SETUP=1"
-if /i "%~1"=="--dry-run" set "DRY_RUN=1"
+if /i "%~1"=="--check"        set "DO_CHECK=1"
+if /i "%~1"=="--setup"        set "FORCE_SETUP=1"
+if /i "%~1"=="--no-browser"   set "NO_BROWSER=1"
+if /i "%~1"=="--dry-run"      set "DRY_RUN=1"
 shift
 goto :parse_args
 :args_done
@@ -44,66 +50,142 @@ echo.
 
 if not exist "app.py" goto :no_app
 if "%DRY_RUN%"=="1" goto :dry_run
-if "%FORCE_SETUP%"=="1" goto :need_setup
 
 rem ---------------------------------------------------------------------------
-rem 1. Is the environment already usable?  (venv exists AND packages import)
+rem 1. Detect the toolchain (uv preferred, then py launcher, then python)
 rem ---------------------------------------------------------------------------
-if not exist "%VENV_PY%" goto :need_setup
+set "UV_CMD="
+where uv >nul 2>nul
+if not errorlevel 1 set "UV_CMD=uv"
 
-echo [1/3] Checking the existing virtual environment ...
-"%VENV_PY%" -c "import streamlit, torch, torchvision, facenet_pytorch, numpy, PIL, pandas" >nul 2>nul
-if errorlevel 1 goto :deps_missing
-echo       OK - .venv is ready.
-goto :setup_done
+set "PY_CMD="
+if not defined PY_CMD py -3.12 -c "import sys" >nul 2>nul & if not errorlevel 1 set "PY_CMD=py -3.12"
+if not defined PY_CMD py -3.11 -c "import sys" >nul 2>nul & if not errorlevel 1 set "PY_CMD=py -3.11"
+if not defined PY_CMD py -3.10 -c "import sys" >nul 2>nul & if not errorlevel 1 set "PY_CMD=py -3.10"
+if not defined PY_CMD py -c "import sys" >nul 2>nul & if not errorlevel 1 set "PY_CMD=py"
+if not defined PY_CMD python -c "import sys" >nul 2>nul & if not errorlevel 1 set "PY_CMD=python"
 
-:deps_missing
-echo       Some packages are missing in .venv, they will be installed now.
-goto :need_setup
+if defined UV_CMD goto :have_tool
+if defined PY_CMD goto :have_tool
+echo [ERROR] Neither "uv" nor a usable Python was found.
+echo.
+echo   Install uv (recommended, one line, no admin rights needed):
+echo       powershell -c "irm https://astral.sh/uv/install.ps1 ^| iex"
+echo.
+echo   Or install Python 3.10 - 3.12 from python.org and tick
+echo   "Add Python to PATH" during setup.
+echo.
+pause
+exit /b 1
+
+:have_tool
+echo [1/6] Toolchain detected:
+if defined UV_CMD uv --version
+if defined PY_CMD %PY_CMD% -c "import sys;print('      Python:', sys.version.split()[0])"
 
 rem ---------------------------------------------------------------------------
-rem 2. First run (or repair): let run.bat build the environment
+rem 2. Create / verify the virtual environment
+rem    An existing .venv is health-checked: a moved/renamed venv keeps absolute
+rem    paths in its launchers and silently misbehaves, so it is rebuilt.
 rem ---------------------------------------------------------------------------
-:need_setup
-echo [1/3] Preparing the environment (first run or repair) ...
-echo.
-echo       Steps: create .venv -^> install requirements.txt -^> download weights.
-echo       This needs a network connection and may take several minutes.
-echo       A Tsinghua PyPI mirror is tried first (much faster in mainland China).
-echo.
-call "%~dp0run.bat" --setup-only
-if errorlevel 1 goto :setup_failed
-echo.
+if "%FORCE_SETUP%"=="1" goto :deps_check
+if exist "%VENV_PY%" goto :venv_check
+goto :create_venv
 
-:setup_done
-echo [1/3] Environment is ready.
-echo.
+:venv_check
+"%VENV_PY%" -c "import sys" >nul 2>nul
+if errorlevel 1 goto :create_venv
+if not defined UV_CMD goto :venv_check_pip
+goto :venv_ok
 
+:venv_check_pip
+"%VENV_PY%" -m pip --version >nul 2>nul
+if not errorlevel 1 goto :venv_ok
+echo [WARN] Existing .venv has no pip, rebuilding ...
+goto :create_venv
+
+:venv_ok
+echo [2/6] Virtual environment .venv is usable.
+goto :deps_check
+
+:create_venv
+echo [2/6] Creating virtual environment .venv ...
+if exist "%VENV_PY%" (
+    echo        Removing a broken .venv first ...
+    rmdir /s /q .venv 2>nul
+)
+if exist "%VENV_PY%" goto :venv_failed
+if defined UV_CMD (
+    uv venv .venv --python 3.11 >nul 2>nul
+    if not exist "%VENV_PY%" uv venv .venv >nul 2>nul
+) else (
+    %PY_CMD% -m venv .venv
+)
+if not exist "%VENV_PY%" goto :venv_failed
+if not defined UV_CMD (
+    "%VENV_PY%" -m pip --version >nul 2>nul
+    if errorlevel 1 (
+        echo [WARN] This Python cannot bootstrap pip into a venv. Please install uv:
+        echo         powershell -c "irm https://astral.sh/uv/install.ps1 ^| iex"
+        rmdir /s /q .venv 2>nul
+        goto :venv_failed
+    )
+)
+echo        Virtual environment ready.
+
+rem ---------------------------------------------------------------------------
+rem 3. Install dependencies (single source of truth = requirements.txt)
+rem    Tsinghua mirror tried first (faster in mainland China), then PyPI.
+rem ---------------------------------------------------------------------------
+:deps_check
+echo [3/6] Checking dependencies ...
+"%VENV_PY%" -c "import streamlit, torch, torchvision, facenet_pytorch, numpy, PIL, pandas, sklearn, cv2" >nul 2>nul
+if not errorlevel 1 goto :deps_ok
+echo        Some packages are missing, installing requirements.txt ...
+if defined UV_CMD (
+    uv pip install --python "%VENV_PY%" -r requirements.txt --default-index https://pypi.tuna.tsinghua.edu.cn/simple >nul
+    if errorlevel 1 uv pip install --python "%VENV_PY%" -r requirements.txt
+) else (
+    "%VENV_PY%" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 60
+    if errorlevel 1 "%VENV_PY%" -m pip install -r requirements.txt --timeout 60
+)
+"%VENV_PY%" -c "import streamlit, torch, torchvision, facenet_pytorch, numpy, PIL, pandas, sklearn, cv2" >nul 2>nul
+if errorlevel 1 goto :deps_failed
+echo        Dependencies ready.
+
+:deps_ok
+echo.
+echo [4/6] Preparing pretrained model weights (first run downloads ~150 MB) ...
+"%VENV_PY%" prefetch_models.py
+if errorlevel 1 echo [WARN] Weight download had failures - the app will retry when needed.
+
+rem ---------------------------------------------------------------------------
+rem 5. Self test (skipped by default on a healthy env; --check forces it)
+rem ---------------------------------------------------------------------------
 if "%DO_CHECK%"=="1" goto :run_check
 goto :launch
 
 :run_check
-echo [2/3] Running the project self test ...
 echo.
+echo [5/6] Running the project self test ...
 "%VENV_PY%" self_test.py
-echo.
-goto :launch
+if errorlevel 1 echo [WARN] Self test reported failures - see above, but still launching.
 
-rem ---------------------------------------------------------------------------
-rem 3. Launch the web UI
-rem ---------------------------------------------------------------------------
 :launch
-echo [3/3] Starting the web UI ...
+echo.
+echo [6/6] Starting the web UI ...
 echo ------------------------------------------------------------
 echo   URL : http://localhost:8501
-echo         (the browser should open automatically)
-echo   Stop: press Ctrl+C here, or simply close this window
+echo   Do NOT use "python app.py" - this app runs under Streamlit.
+echo   Close this window (or press Ctrl+C) to stop the app.
 echo ------------------------------------------------------------
 echo.
-echo   Reminder: this app must run through Streamlit.
-echo             Never start it with "python app.py".
-echo.
+if "%NO_BROWSER%"=="1" goto :launch_headless
+start "" http://localhost:8501
+
+:launch_headless
 "%VENV_PY%" -m streamlit run app.py
+
 echo.
 echo The app has stopped.
 pause
@@ -115,30 +197,31 @@ rem ---------------------------------------------------------------------------
 :no_app
 echo [ERROR] app.py was not found next to this script.
 echo         Put start.bat inside the project folder and run it there.
-echo.
 pause
 exit /b 1
 
-:setup_failed
+:venv_failed
 echo.
-echo [ERROR] Automatic setup failed. Please check the messages above, then:
-echo         1. read the troubleshooting section in README.md
-echo         2. or run the steps manually:
-echo              uv venv .venv --python 3.11
-echo              uv pip install --python .venv\Scripts\python.exe -r requirements.txt --default-index https://pypi.tuna.tsinghua.edu.cn/simple
-echo              .venv\Scripts\python.exe -m streamlit run app.py
-echo.
+echo [ERROR] Could not create a usable virtual environment .venv
+echo         Please install uv once, then run this script again:
+echo             powershell -c "irm https://astral.sh/uv/install.ps1 ^| iex"
 pause
 exit /b 1
 
-rem ---------------------------------------------------------------------------
-rem Dry run: detection only, nothing is created, installed or launched
-rem ---------------------------------------------------------------------------
+:deps_failed
+echo.
+echo [ERROR] Dependency installation failed. Check the network and run again.
+echo         Alternative mirrors:
+echo             https://mirrors.aliyun.com/pypi/simple
+echo             https://mirrors.ustc.edu.cn/pypi/simple
+pause
+exit /b 1
+
 :dry_run
 echo [dry-run] project folder    : %~dp0
 echo [dry-run] venv interpreter  : "%VENV_PY%"
 if exist "%VENV_PY%" echo [dry-run] venv status       : exists, would be checked with "import streamlit, torch, ..."
-if not exist "%VENV_PY%" echo [dry-run] venv status       : missing, would run "run.bat --setup-only"
+if not exist "%VENV_PY%" echo [dry-run] venv status       : missing, would be created
 echo [dry-run] self test         : %DO_CHECK% (1 = would run self_test.py)
 echo [dry-run] launch command    : "%VENV_PY%" -m streamlit run app.py
 echo [dry-run] URL               : http://localhost:8501
