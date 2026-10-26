@@ -42,6 +42,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
+from similarity import l2_normalize
+
 SCHEMA_VERSION = 1
 DEFAULT_DB_PATH = Path("face_db.pkl")
 DEFAULT_FACE_DIR = Path("registered_faces")
@@ -114,6 +116,19 @@ class FaceDatabase:
             "people": {},
         }
 
+    def _reset_to_empty(self) -> None:
+        """把库重置成空库状态（首次运行 / 文件损坏时用）。"""
+        payload = self._empty_payload()
+        self.people = payload["people"]
+        self.meta = payload["meta"]
+        self.created_at = payload["created_at"]
+        self.updated_at = payload["updated_at"]
+
+    def _sync_meta_counts(self) -> None:
+        """同步 meta 里的人数与特征条数（增删改之后都要调）。"""
+        self.meta["num_people"] = len(self.people)
+        self.meta["num_embeddings"] = self.num_embeddings
+
     def load(self, force: bool = False) -> "FaceDatabase":
         """从 pickle 文件读取人脸库。
 
@@ -121,11 +136,7 @@ class FaceDatabase:
         - 文件损坏：把坏文件改名备份，然后以空库启动，并在 last_error 里说明原因。
         """
         if not self.db_path.exists():
-            payload = self._empty_payload()
-            self.people = payload["people"]
-            self.meta = payload["meta"]
-            self.created_at = payload["created_at"]
-            self.updated_at = payload["updated_at"]
+            self._reset_to_empty()
             return self
 
         if self.people and not force:
@@ -149,11 +160,7 @@ class FaceDatabase:
             except Exception:
                 detail = "无法备份损坏文件"
             self.last_error = f"人脸库文件读取失败（{exc}），{detail}，已按空库启动。"
-            payload = self._empty_payload()
-            self.people = payload["people"]
-            self.meta = payload["meta"]
-            self.created_at = payload["created_at"]
-            self.updated_at = payload["updated_at"]
+            self._reset_to_empty()
         return self
 
     def save(self) -> Path:
@@ -226,7 +233,7 @@ class FaceDatabase:
 
         # 特征是否 L2 归一化：统一在入库时做一次，保证库内、查询时口径一致
         if self.l2_normalize:
-            emb = emb / np.maximum(np.linalg.norm(emb, axis=1, keepdims=True), 1e-10)
+            emb = l2_normalize(emb, axis=1)
 
         # 维度一致性检查：换了骨干网络后维度或特征空间会变，必须重新注册
         existing_dim = self.embedding_dim
@@ -285,8 +292,7 @@ class FaceDatabase:
         }
         self.meta["backbone"] = backbone or self.meta.get("backbone")
         self.meta["embedding_dim"] = int(new_emb.shape[1])
-        self.meta["num_people"] = len(self.people)
-        self.meta["num_embeddings"] = int(sum(len(v["embeddings"]) for v in self.people.values()))
+        self._sync_meta_counts()
         self.save()
 
         return PersonInfo(
@@ -311,8 +317,7 @@ class FaceDatabase:
         if person_dir.exists():
             shutil.rmtree(person_dir, ignore_errors=True)
 
-        self.meta["num_people"] = len(self.people)
-        self.meta["num_embeddings"] = int(sum(len(v["embeddings"]) for v in self.people.values()))
+        self._sync_meta_counts()
         self.save()
         return True
 
@@ -342,8 +347,7 @@ class FaceDatabase:
         self.people = {}
         if self.face_dir.exists():
             shutil.rmtree(self.face_dir, ignore_errors=True)
-        self.meta["num_people"] = 0
-        self.meta["num_embeddings"] = 0
+        self._sync_meta_counts()
         self.save()
 
     # ==================================================================
@@ -461,8 +465,6 @@ class FaceDatabase:
 # 会在 .selftest/ 目录里建一个临时库，验证增删查与读写往返，跑完自动清理
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import shutil
-
     work = Path(".selftest")
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)

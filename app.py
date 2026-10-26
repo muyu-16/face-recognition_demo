@@ -27,6 +27,7 @@ app.py
 from __future__ import annotations
 
 import hashlib
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -110,6 +111,9 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+from image_utils import to_rgb_pil
+from ui_utils import show_image
+
 # ---------------------------------------------------------------------------
 # 页面配置必须是最先执行的 Streamlit 命令
 # ---------------------------------------------------------------------------
@@ -124,9 +128,7 @@ st.set_page_config(
 # 依赖检查：缺库时给同学一个能看懂的中文提示，而不是一屏 traceback
 # ---------------------------------------------------------------------------
 try:
-    import torch
-
-    from face_detector import FaceDetector, resolve_device
+    from face_detector import FaceDetector
     from feature_extractor import FeatureExtractor
     from face_database import FaceDatabase, sanitize_name
     from similarity import (
@@ -210,47 +212,6 @@ def load_database(db_path: str, face_dir: str) -> FaceDatabase:
 # ---------------------------------------------------------------------------
 # 小工具函数
 # ---------------------------------------------------------------------------
-def show_image(image, caption: Optional[str] = None) -> None:
-    """自适应宽度的图片显示（兼容不同 Streamlit 版本的参数名）。
-
-    Streamlit 1.4x 起 `use_container_width` 已废弃（1.65 会打印弃用警告），
-    新版应改用 `width="stretch"`；这里按"新 → 旧 → 更旧"依次回退。
-    """
-    try:
-        st.image(image, caption=caption, width="stretch")
-    except TypeError:
-        try:
-            st.image(image, caption=caption, use_container_width=True)
-        except TypeError:  # 更老的 Streamlit
-            st.image(image, caption=caption, use_column_width=True)
-
-
-def to_pil(uploaded) -> Image.Image:
-    """把各种来源统一转成 RGB 的 PIL.Image。
-
-    要同时兼容三种输入：
-      * Streamlit 的 file_uploader / camera_input 返回的上传对象（有 .read()）；
-      * 已经是 PIL.Image 的图（摄像头流程里会再传进来，必须支持幂等转换）；
-      * numpy 数组（画框结果、裁剪出的人脸等）。
-    """
-    if isinstance(uploaded, Image.Image):
-        img = uploaded
-    elif isinstance(uploaded, np.ndarray):
-        arr = uploaded
-        if arr.ndim == 2:                       # 灰度 -> RGB
-            arr = np.stack([arr] * 3, axis=-1)
-        if arr.ndim == 3 and arr.shape[2] == 4:  # RGBA -> RGB
-            arr = arr[:, :, :3]
-        if arr.dtype != np.uint8:
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
-        img = Image.fromarray(np.ascontiguousarray(arr))
-    else:
-        img = Image.open(uploaded)              # 上传对象 / 文件路径
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return img
-
-
 def detect_and_extract(
     image,
     detector: FaceDetector,
@@ -278,8 +239,25 @@ def image_fingerprint(image) -> str:
     避免反复按快门把同一张图注册 5 遍——那样 5 条特征几乎相同，
     等于只注册了 1 张，样本多样性为零。
     """
-    arr = np.asarray(to_pil(image).resize((64, 64)), dtype=np.uint8)
+    arr = np.asarray(to_rgb_pil(image).resize((64, 64)), dtype=np.uint8)
     return hashlib.sha256(arr.tobytes()).hexdigest()[:16]
+
+
+def _make_record(name: str, similarity: float, threshold: float,
+                 is_unknown: Optional[bool], face_count: int) -> dict:
+    """构造一条识别记录（识别记录表与连拍记录表共用同一套字段）。
+
+    两个页面都在记"某时刻、识别成了谁、相似度多少"，
+    字段名必须保持一致，否则后面拼 DataFrame 会错位。
+    """
+    return {
+        "时刻": datetime.now().strftime("%H:%M:%S"),
+        "识别结果": name,
+        "相似度": round(float(similarity), 4),
+        "阈值": round(float(threshold), 2),
+        "是否陌生人": is_unknown,
+        "人脸数": face_count,
+    }
 
 
 def flash(level: str, message: str) -> None:
@@ -414,6 +392,14 @@ def init_session_state() -> None:
             st.session_state[key] = value
 
 
+def _clear_reg_session() -> None:
+    """清空摄像头采集缓存的 4 个一一对应列表（reg_shots / hashes / info / analysis）。"""
+    st.session_state.reg_shots = []
+    st.session_state.reg_shot_hashes = []
+    st.session_state.reg_shot_info = []
+    st.session_state.reg_analysis = []
+
+
 # ===========================================================================
 # 侧边栏：所有可调参数
 # ===========================================================================
@@ -500,6 +486,278 @@ def render_sidebar() -> Dict[str, object]:
 # ===========================================================================
 # 标签页 1：人员注册
 # ===========================================================================
+def _collect_upload_candidates() -> List[Tuple[str, Image.Image]]:
+    """来源①：上传图片（可多选）。"""
+    candidates: List[Tuple[str, Image.Image]] = []
+    uploaded_files = st.file_uploader(
+        f"选择人脸图片（建议同一人不同角度/表情，至少 {MIN_REGISTER_IMAGES} 张）",
+        type=["jpg", "jpeg", "png", "bmp", "webp"],
+        accept_multiple_files=True,
+        key="reg_uploader",
+    )
+    for file in uploaded_files or []:
+        try:
+            candidates.append((file.name, to_rgb_pil(file)))
+        except Exception as err:
+            st.warning(f"图片 {file.name} 读取失败：{err}")
+    return candidates
+
+
+def _collect_camera_candidates(detector: FaceDetector) -> List[Tuple[str, Image.Image]]:
+    """来源②：浏览器摄像头连拍。
+
+    拍照即自动入库，并立刻做一次「体检 + 机位识别」，告诉用户这张属于哪个机位、
+    质量几分、下一张该拍什么；不合格的当场提示。
+    """
+    st.caption(
+        "拍照即自动存入采集列表，无需再点按钮；每张照片会立刻做一次「体检 + 机位识别」："
+        "告诉你这张属于哪个机位（正面/左转/右转/抬头/低头）、质量几分、"
+        "以及**下一张该拍什么**。不合格（没人脸/多张脸/太糊/太暗）的会直接提示。"
+    )
+
+    # 摄像头组件用递增的 key：取到照片后 key+1，组件即被重置，可以接着拍下一张
+    shot = st.camera_input("③ 拍照（每点一次快门自动入库）",
+                           key=f"reg_camera_{st.session_state.reg_shot_seq}")
+
+    if shot is not None:
+        # ---- 抓到新照片：去重 -> 体检 + 机位分析 -> 入库 -> rerun 以复位摄像头 ----
+        image = to_rgb_pil(shot)
+        fingerprint = image_fingerprint(image)
+        if fingerprint in st.session_state.reg_shot_hashes:
+            flash("warning", "这张照片与已采集的**完全重复**，已忽略；"
+                             "请换个角度 / 表情 / 距离再拍，重复样本对识别没有帮助。")
+        else:
+            faces = detector.detect(image)
+            info = evaluate_shot(image, detector, faces=faces)
+            # 参考"已有的正脸照"提供本人俯仰基线
+            reference = None
+            for rec in st.session_state.reg_analysis:
+                if rec and rec.get("slot") == "front":
+                    reference = guide.appearance_of(rec)
+                    break
+            analysis = (guide.assess_quality(image, faces[0], reference=reference)
+                        if faces else None)
+
+            st.session_state.reg_shots.append(image)
+            st.session_state.reg_shot_hashes.append(fingerprint)
+            st.session_state.reg_shot_info.append(info)
+            st.session_state.reg_analysis.append(analysis)
+
+            index_now = len(st.session_state.reg_shots)
+            if analysis is None:
+                flash("error", f"已采集第 {index_now} 张，但{info['message']}")
+            else:
+                prior = [a for a in st.session_state.reg_analysis[:-1] if a]
+                repeated = guide.duplicate_pose(analysis["pose"], prior)
+                cov = guide.coverage([a for a in st.session_state.reg_analysis if a])
+
+                parts = [f"已采集第 {index_now} 张：机位「{analysis['slot_title']}」，"
+                         f"质量 {analysis['score']:.0f} 分"]
+                if analysis["flags"]:
+                    parts.append("；".join(analysis["flags"][:2]))
+                if repeated:
+                    parts.append("⚠️ 这张和已有照片的姿态几乎一样，换机位更有价值")
+                parts.append(cov["advice"])
+                level = "warning" if (analysis["flags"] or repeated) else "ok"
+                flash(level, "　".join(parts))
+        st.session_state.reg_shot_seq += 1
+        st.rerun()
+
+    show_flash()
+
+    collected = len(st.session_state.reg_shots)
+    if collected:
+        done = min(collected / float(MIN_REGISTER_IMAGES), 1.0)
+        st.progress(done, text=(
+            f"已采集 {collected}/{MIN_REGISTER_IMAGES} 张"
+            + ("（已达标，可以注册；建议再拍不同角度让样本更丰富）"
+               if collected >= MIN_REGISTER_IMAGES else "（还差 "
+               f"{MIN_REGISTER_IMAGES - collected} 张）")
+        ))
+        cols = st.columns(5)
+        for idx, img in enumerate(list(st.session_state.reg_shots)):
+            info = st.session_state.reg_shot_info[idx]
+            analysis = st.session_state.reg_analysis[idx] if idx < len(st.session_state.reg_analysis) else None
+            with cols[idx % 5]:
+                show_image(img, caption=f"第 {idx + 1} 张")
+                st.caption(f"{SHOT_ICONS.get(info['level'], '')} {info['message']}")
+                if analysis is not None:
+                    st.caption(f"机位：{analysis['slot_title']}｜质量 {analysis['score']:.0f} 分")
+                    for flag in analysis["flags"][:1]:
+                        st.caption(f"⚠️ {flag}")
+                if st.button("🗑️ 删除重拍", key=f"del_shot_{idx}"):
+                    # 四个列表必须同步删除，否则指纹/体检/机位分析会错位
+                    st.session_state.reg_shots.pop(idx)
+                    st.session_state.reg_shot_hashes.pop(idx)
+                    st.session_state.reg_shot_info.pop(idx)
+                    if idx < len(st.session_state.reg_analysis):
+                        st.session_state.reg_analysis.pop(idx)
+                    st.rerun()
+        if st.button("🗑️ 清空采集列表，全部重拍"):
+            _clear_reg_session()
+            st.rerun()
+
+        st.divider()
+        render_capture_guide([a for a in st.session_state.reg_analysis if a])
+    else:
+        st.info("还没有采集到照片：点击上面的圆形快门按钮拍照。")
+        st.divider()
+        render_capture_guide([])
+
+    return [(f"摄像头_{i + 1}", img)
+            for i, img in enumerate(st.session_state.reg_shots)]
+
+
+def _collect_webrtc_candidates(detector: FaceDetector,
+                                name: str) -> List[Tuple[str, Image.Image]]:
+    """来源③：浏览器 WebRTC 实时录入。"""
+    # 防御：Streamlit 只重跑主脚本，不会重新 import 已加载的模块。
+    # 如果开发过程中给 live_enrollment 加了新函数而进程还是旧的，
+    # 直接调用会抛 AttributeError；这里改成给出"请重启"的明确提示。
+    if not hasattr(live_enroll, "render_webrtc_enrollment"):
+        st.error(
+            "检测到 `live_enrollment` 模块是**旧版本**（Streamlit 只重跑主脚本，"
+            "不会重新加载已 import 的模块）。\n\n"
+            "**请重启应用**：在运行 Streamlit 的窗口按 `Ctrl+C`，再执行\n"
+            "`cd D:\\face_demo` 与 `.venv\\Scripts\\python.exe -m streamlit run app.py`。"
+        )
+        return []
+    return live_enroll.render_webrtc_enrollment(
+        detector,
+        guide_renderer=render_capture_guide,
+        name=name,          # 没填姓名时不会保存（自动/手动都不行）
+    )
+
+
+def _render_register_preview(candidates: List[Tuple[str, Image.Image]],
+                             detector: FaceDetector) -> None:
+    """「仅检测预览」：跑一遍 MTCNN，画框并给出机位/质量分（不提取特征）。"""
+    with st.spinner("MTCNN 检测中……"):
+        rows, images, captions = [], [], []
+        preview_analyses: List[dict] = []
+        # 先检测一遍（顺便定出"参考正脸照"当俯仰基线），再带参考做机位分析
+        detected: List[Tuple[str, "Image.Image", list]] = []
+        for label, image in candidates:
+            faces = detector.detect(image)
+            detected.append((label, image, faces))
+            rows.append({
+                "图片": label,
+                "检测到人脸数": len(faces),
+                "最大人脸置信度": round(max((f.prob for f in faces), default=0.0), 4),
+                "状态": "✅ 可用" if faces else "❌ 未检测到人脸",
+            })
+        reference = _first_front_reference(detected)
+        for (label, image, faces), row in zip(detected, rows):
+            if faces:
+                analysis = guide.assess_quality(image, faces[0], reference=reference)
+                preview_analyses.append(analysis)
+                row["机位"] = analysis["slot_title"]
+                row["质量分"] = round(analysis["score"])
+            images.append(detector.draw(image, faces, [f"face{i + 1}" for i in range(len(faces))])
+                          if faces else image)
+            captions.append(label)
+        st.session_state.reg_preview = (rows, images, captions)
+        st.session_state["reg_preview_analyses"] = preview_analyses
+
+    if st.session_state.reg_preview is not None:
+        rows, images, captions = st.session_state.reg_preview
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        cols = st.columns(min(5, len(images)))
+        for idx, (img, cap) in enumerate(zip(images, captions)):
+            with cols[idx % len(cols)]:
+                show_image(img, caption=cap)
+        if st.session_state.get("reg_preview_analyses"):
+            st.divider()
+            render_capture_guide(st.session_state["reg_preview_analyses"])
+
+
+def _do_register(candidates: List[Tuple[str, Image.Image]],
+                 name: str, overwrite: bool, cfg: Dict[str, object],
+                 detector: FaceDetector, extractor: FeatureExtractor,
+                 db: FaceDatabase) -> None:
+    """正式注册：检测 → 裁剪 → 提特征 → 写入人脸库。"""
+    progress = st.progress(0.0, text="开始处理……")
+    rows: List[dict] = []
+    kept_crops: List[np.ndarray] = []
+    kept_embeddings: List[np.ndarray] = []
+    kept_analyses: List[dict] = []
+    total = len(candidates)
+
+    # 第一遍：检测（顺便定出"参考正脸照"当本人俯仰基线）
+    detected: List[Tuple[str, "Image.Image", list]] = []
+    for label, image in candidates:
+        detected.append((label, image, detector.detect(image)))
+    reference = _first_front_reference(detected)
+
+    # 第二遍：裁剪 + 提特征 + 机位分析（带参考正脸照的俯仰基线）
+    for idx, (label, image, faces) in enumerate(detected, start=1):
+        progress.progress((idx - 1) / total, text=f"正在处理 {label}（{idx}/{total}）")
+        if not faces:
+            rows.append({"图片": label, "状态": "❌ 未检测到人脸，已跳过",
+                         "置信度": 0.0, "备注": "换一张更清晰/更近的照片"})
+            continue
+
+        note = "✅ 使用最大的人脸"
+        if len(faces) > 1:
+            note = f"⚠️ 检测到 {len(faces)} 张人脸，取最大的一张"
+        crop = detector.crop(image, faces[0])           # 对齐 + 裁剪到 160x160
+        embedding = extractor.extract(crop)             # 512 维特征（已 L2 归一化）
+        analysis = guide.assess_quality(image, faces[0], reference=reference)
+        kept_crops.append(crop)
+        kept_embeddings.append(embedding)
+        kept_analyses.append(analysis)
+        rows.append({"图片": label, "状态": "✅ 特征提取成功",
+                     "置信度": round(float(faces[0].prob), 4),
+                     "机位": analysis["slot_title"],
+                     "质量分": round(analysis["score"]),
+                     "备注": note})
+
+    progress.progress(1.0, text="处理完成")
+
+    # 注册前先给出采集覆盖度提示（尤其针对上传的一批同角度照片）
+    if kept_analyses:
+        st.divider()
+        render_capture_guide(kept_analyses)
+
+    if len(kept_embeddings) < MIN_REGISTER_IMAGES:
+        st.error(
+            f"❌ 只有 {len(kept_embeddings)} 张图片成功提取到人脸特征，"
+            f"少于要求的 {MIN_REGISTER_IMAGES} 张，本次未注册。\n\n"
+            f"建议：换成正面、清晰、光照均匀的照片，或把侧边栏的"
+            f"「最小人脸尺寸」调小一点后重试。"
+        )
+    else:
+        try:
+            info = db.add_person(
+                name=name,
+                embeddings=np.stack(kept_embeddings, axis=0),
+                face_images=kept_crops,
+                overwrite=overwrite,
+                backbone=cfg["backbone"],
+            )
+            st.success(
+                f"🎉 注册成功！『{info.name}』当前共 {info.num_images} 条人脸特征，"
+                f"数据已保存到 {db.db_path}"
+            )
+            st.balloons()
+            # 注册成功后清空摄像头采集缓存（几个列表必须一起清，保持一一对应）
+            _clear_reg_session()
+            st.session_state["reg_preview_analyses"] = []
+            cov = guide.coverage(kept_analyses)
+            if not cov["complete"]:
+                missing = cov["missing_core"]
+                st.warning(
+                    "本次覆盖的核心机位不全，缺："
+                    + "、".join(guide.PLAN_BY_KEY[k]["title"] for k in missing)
+                    + "。\n\n建议补拍后**追加**（不要勾选「覆盖该人已有特征」，直接再注册一次即可追加样本）——"
+                    "库内样本的角度越全，实时识别越稳。"
+                )
+        except Exception as err:
+            st.error(f"注册失败：{err}")
+
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
 def render_register_tab(cfg: Dict[str, object], detector: FaceDetector,
                         extractor: FeatureExtractor, db: FaceDatabase) -> None:
     """人员注册：输入姓名，采集/上传至少 5 张人脸图，提特征入库。"""
@@ -526,139 +784,12 @@ def render_register_tab(cfg: Dict[str, object], detector: FaceDetector,
                                "③ 浏览器实时录入：WebRTC 视频流，边拍边自动筛出覆盖各机位的帧。")
 
     # ---------------- 收集候选图片 ----------------
-    candidates: List[Tuple[str, Image.Image]] = []
-
     if source.startswith("📁"):
-        uploaded_files = st.file_uploader(
-            f"选择人脸图片（建议同一人不同角度/表情，至少 {MIN_REGISTER_IMAGES} 张）",
-            type=["jpg", "jpeg", "png", "bmp", "webp"],
-            accept_multiple_files=True,
-            key="reg_uploader",
-        )
-        for file in uploaded_files or []:
-            try:
-                candidates.append((file.name, to_pil(file)))
-            except Exception as err:
-                st.warning(f"图片 {file.name} 读取失败：{err}")
+        candidates = _collect_upload_candidates()
     elif source.startswith("📷"):
-        st.caption(
-            "拍照即自动存入采集列表，无需再点按钮；每张照片会立刻做一次「体检 + 机位识别」："
-            "告诉你这张属于哪个机位（正面/左转/右转/抬头/低头）、质量几分、"
-            "以及**下一张该拍什么**。不合格（没人脸/多张脸/太糊/太暗）的会直接提示。"
-        )
-
-        # 摄像头组件用递增的 key：取到照片后 key+1，组件即被重置，可以接着拍下一张
-        shot = st.camera_input("③ 拍照（每点一次快门自动入库）",
-                               key=f"reg_camera_{st.session_state.reg_shot_seq}")
-
-        if shot is not None:
-            # ---- 抓到新照片：去重 -> 体检 + 机位分析 -> 入库 -> rerun 以复位摄像头 ----
-            image = to_pil(shot)
-            fingerprint = image_fingerprint(image)
-            if fingerprint in st.session_state.reg_shot_hashes:
-                flash("warning", "这张照片与已采集的**完全重复**，已忽略；"
-                                 "请换个角度 / 表情 / 距离再拍，重复样本对识别没有帮助。")
-            else:
-                faces = detector.detect(image)
-                info = evaluate_shot(image, detector, faces=faces)
-                # 参考"已有的正脸照"提供本人俯仰基线
-                reference = None
-                for rec in st.session_state.reg_analysis:
-                    if rec and rec.get("slot") == "front":
-                        reference = guide.appearance_of(rec)
-                        break
-                analysis = (guide.assess_quality(image, faces[0], reference=reference)
-                            if faces else None)
-
-                st.session_state.reg_shots.append(image)
-                st.session_state.reg_shot_hashes.append(fingerprint)
-                st.session_state.reg_shot_info.append(info)
-                st.session_state.reg_analysis.append(analysis)
-
-                index_now = len(st.session_state.reg_shots)
-                if analysis is None:
-                    flash("error", f"已采集第 {index_now} 张，但{info['message']}")
-                else:
-                    prior = [a for a in st.session_state.reg_analysis[:-1] if a]
-                    repeated = guide.duplicate_pose(analysis["pose"], prior)
-                    cov = guide.coverage([a for a in st.session_state.reg_analysis if a])
-
-                    parts = [f"已采集第 {index_now} 张：机位「{analysis['slot_title']}」，"
-                             f"质量 {analysis['score']:.0f} 分"]
-                    if analysis["flags"]:
-                        parts.append("；".join(analysis["flags"][:2]))
-                    if repeated:
-                        parts.append("⚠️ 这张和已有照片的姿态几乎一样，换机位更有价值")
-                    parts.append(cov["advice"])
-                    level = "warning" if (analysis["flags"] or repeated) else "ok"
-                    flash(level, "　".join(parts))
-            st.session_state.reg_shot_seq += 1
-            st.rerun()
-
-        show_flash()
-
-        collected = len(st.session_state.reg_shots)
-        if collected:
-            done = min(collected / float(MIN_REGISTER_IMAGES), 1.0)
-            st.progress(done, text=(
-                f"已采集 {collected}/{MIN_REGISTER_IMAGES} 张"
-                + ("（已达标，可以注册；建议再拍不同角度让样本更丰富）"
-                   if collected >= MIN_REGISTER_IMAGES else "（还差 "
-                   f"{MIN_REGISTER_IMAGES - collected} 张）")
-            ))
-            cols = st.columns(5)
-            for idx, img in enumerate(list(st.session_state.reg_shots)):
-                info = st.session_state.reg_shot_info[idx]
-                analysis = st.session_state.reg_analysis[idx] if idx < len(st.session_state.reg_analysis) else None
-                with cols[idx % 5]:
-                    show_image(img, caption=f"第 {idx + 1} 张")
-                    st.caption(f"{SHOT_ICONS.get(info['level'], '')} {info['message']}")
-                    if analysis is not None:
-                        st.caption(f"机位：{analysis['slot_title']}｜质量 {analysis['score']:.0f} 分")
-                        for flag in analysis["flags"][:1]:
-                            st.caption(f"⚠️ {flag}")
-                    if st.button("🗑️ 删除重拍", key=f"del_shot_{idx}"):
-                        # 四个列表必须同步删除，否则指纹/体检/机位分析会错位
-                        st.session_state.reg_shots.pop(idx)
-                        st.session_state.reg_shot_hashes.pop(idx)
-                        st.session_state.reg_shot_info.pop(idx)
-                        if idx < len(st.session_state.reg_analysis):
-                            st.session_state.reg_analysis.pop(idx)
-                        st.rerun()
-            if st.button("🗑️ 清空采集列表，全部重拍"):
-                st.session_state.reg_shots = []
-                st.session_state.reg_shot_hashes = []
-                st.session_state.reg_shot_info = []
-                st.session_state.reg_analysis = []
-                st.rerun()
-
-            st.divider()
-            render_capture_guide([a for a in st.session_state.reg_analysis if a])
-        else:
-            st.info("还没有采集到照片：点击上面的圆形快门按钮拍照。")
-            st.divider()
-            render_capture_guide([])
-        candidates = [(f"摄像头_{i + 1}", img)
-                      for i, img in enumerate(st.session_state.reg_shots)]
+        candidates = _collect_camera_candidates(detector)
     else:
-        # ---------------- 浏览器实时录入（WebRTC）----------------
-        # 防御：Streamlit 只重跑主脚本，不会重新 import 已加载的模块。
-        # 如果开发过程中给 live_enrollment 加了新函数而进程还是旧的，
-        # 直接调用会抛 AttributeError；这里改成给出"请重启"的明确提示。
-        if not hasattr(live_enroll, "render_webrtc_enrollment"):
-            st.error(
-                "检测到 `live_enrollment` 模块是**旧版本**（Streamlit 只重跑主脚本，"
-                "不会重新加载已 import 的模块）。\n\n"
-                "**请重启应用**：在运行 Streamlit 的窗口按 `Ctrl+C`，再执行\n"
-                "`cd D:\\face_demo` 与 `.venv\\Scripts\\python.exe -m streamlit run app.py`。"
-            )
-            candidates = []
-        else:
-            candidates = live_enroll.render_webrtc_enrollment(
-                detector,
-                guide_renderer=render_capture_guide,
-                name=name,          # 没填姓名时不会保存（自动/手动都不行）
-            )
+        candidates = _collect_webrtc_candidates(detector, name)
     st.divider()
 
     # ---------------- 检测预览 ----------------
@@ -680,128 +811,11 @@ def render_register_tab(cfg: Dict[str, object], detector: FaceDetector,
             st.success(f"已准备 {len(candidates)} 张图片，可以开始注册")
 
     if do_preview:
-        with st.spinner("MTCNN 检测中……"):
-            rows, images, captions = [], [], []
-            preview_analyses: List[dict] = []
-            # 先检测一遍（顺便定出"参考正脸照"当俯仰基线），再带参考做机位分析
-            detected: List[Tuple[str, "Image.Image", list]] = []
-            for label, image in candidates:
-                faces = detector.detect(image)
-                detected.append((label, image, faces))
-                rows.append({
-                    "图片": label,
-                    "检测到人脸数": len(faces),
-                    "最大人脸置信度": round(max((f.prob for f in faces), default=0.0), 4),
-                    "状态": "✅ 可用" if faces else "❌ 未检测到人脸",
-                })
-            reference = _first_front_reference(detected)
-            for (label, image, faces), row in zip(detected, rows):
-                if faces:
-                    analysis = guide.assess_quality(image, faces[0], reference=reference)
-                    preview_analyses.append(analysis)
-                    row["机位"] = analysis["slot_title"]
-                    row["质量分"] = round(analysis["score"])
-                images.append(detector.draw(image, faces, [f"face{i + 1}" for i in range(len(faces))])
-                              if faces else image)
-                captions.append(label)
-            st.session_state.reg_preview = (rows, images, captions)
-            st.session_state["reg_preview_analyses"] = preview_analyses
-
-    if st.session_state.reg_preview is not None:
-        rows, images, captions = st.session_state.reg_preview
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-        cols = st.columns(min(5, len(images)))
-        for idx, (img, cap) in enumerate(zip(images, captions)):
-            with cols[idx % len(cols)]:
-                show_image(img, caption=cap)
-        if st.session_state.get("reg_preview_analyses"):
-            st.divider()
-            render_capture_guide(st.session_state["reg_preview_analyses"])
+        _render_register_preview(candidates, detector)
 
     # ---------------- 正式注册 ----------------
     if do_register:
-        progress = st.progress(0.0, text="开始处理……")
-        rows: List[dict] = []
-        kept_crops: List[np.ndarray] = []
-        kept_embeddings: List[np.ndarray] = []
-        kept_analyses: List[dict] = []
-        total = len(candidates)
-
-        # 第一遍：检测（顺便定出"参考正脸照"当本人俯仰基线）
-        detected: List[Tuple[str, "Image.Image", list]] = []
-        for label, image in candidates:
-            detected.append((label, image, detector.detect(image)))
-        reference = _first_front_reference(detected)
-
-        # 第二遍：裁剪 + 提特征 + 机位分析（带参考正脸照的俯仰基线）
-        for idx, (label, image, faces) in enumerate(detected, start=1):
-            progress.progress((idx - 1) / total, text=f"正在处理 {label}（{idx}/{total}）")
-            if not faces:
-                rows.append({"图片": label, "状态": "❌ 未检测到人脸，已跳过",
-                             "置信度": 0.0, "备注": "换一张更清晰/更近的照片"})
-                continue
-
-            note = "✅ 使用最大的人脸"
-            if len(faces) > 1:
-                note = f"⚠️ 检测到 {len(faces)} 张人脸，取最大的一张"
-            crop = detector.crop(image, faces[0])           # 对齐 + 裁剪到 160x160
-            embedding = extractor.extract(crop)             # 512 维特征（已 L2 归一化）
-            analysis = guide.assess_quality(image, faces[0], reference=reference)
-            kept_crops.append(crop)
-            kept_embeddings.append(embedding)
-            kept_analyses.append(analysis)
-            rows.append({"图片": label, "状态": "✅ 特征提取成功",
-                         "置信度": round(float(faces[0].prob), 4),
-                         "机位": analysis["slot_title"],
-                         "质量分": round(analysis["score"]),
-                         "备注": note})
-
-        progress.progress(1.0, text="处理完成")
-
-        # 注册前先给出采集覆盖度提示（尤其针对上传的一批同角度照片）
-        if kept_analyses:
-            st.divider()
-            render_capture_guide(kept_analyses)
-
-        if len(kept_embeddings) < MIN_REGISTER_IMAGES:
-            st.error(
-                f"❌ 只有 {len(kept_embeddings)} 张图片成功提取到人脸特征，"
-                f"少于要求的 {MIN_REGISTER_IMAGES} 张，本次未注册。\n\n"
-                f"建议：换成正面、清晰、光照均匀的照片，或把侧边栏的"
-                f"「最小人脸尺寸」调小一点后重试。"
-            )
-        else:
-            try:
-                info = db.add_person(
-                    name=name,
-                    embeddings=np.stack(kept_embeddings, axis=0),
-                    face_images=kept_crops,
-                    overwrite=overwrite,
-                    backbone=cfg["backbone"],
-                )
-                st.success(
-                    f"🎉 注册成功！『{info.name}』当前共 {info.num_images} 条人脸特征，"
-                    f"数据已保存到 {db.db_path}"
-                )
-                st.balloons()
-                # 注册成功后清空摄像头采集缓存（几个列表必须一起清，保持一一对应）
-                st.session_state.reg_shots = []
-                st.session_state.reg_shot_hashes = []
-                st.session_state.reg_shot_info = []
-                st.session_state.reg_analysis = []
-                st.session_state["reg_preview_analyses"] = []
-                if not guide.coverage(kept_analyses)["complete"]:
-                    missing = guide.coverage(kept_analyses)["missing_core"]
-                    st.warning(
-                        "本次覆盖的核心机位不全，缺："
-                        + "、".join(guide.PLAN_BY_KEY[k]["title"] for k in missing)
-                        + "。\n\n建议补拍后**追加**（不要勾选「覆盖该人已有特征」，直接再注册一次即可追加样本）——"
-                        "库内样本的角度越全，实时识别越稳。"
-                    )
-            except Exception as err:
-                st.error(f"注册失败：{err}")
-
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        _do_register(candidates, name, overwrite, cfg, detector, extractor, db)
 
     # ---------------- 当前人脸库概览 ----------------
     with st.expander("📊 当前人脸库概览", expanded=False):
@@ -845,7 +859,7 @@ def render_recognize_tab(cfg: Dict[str, object], detector: FaceDetector,
         uploaded = st.file_uploader("选择一张图片", type=["jpg", "jpeg", "png", "bmp", "webp"],
                                     key="rec_uploader")
         if uploaded is not None:
-            image = to_pil(uploaded)
+            image = to_rgb_pil(uploaded)
     else:
         col_cam, col_btn = st.columns([3, 1])
         with col_cam:
@@ -862,7 +876,7 @@ def render_recognize_tab(cfg: Dict[str, object], detector: FaceDetector,
                 st.session_state.rec_shot_seq += 1
                 st.rerun()
         if shot is not None:
-            image = to_pil(shot)
+            image = to_rgb_pil(shot)
 
     if image is None:
         st.info("请上传图片或使用摄像头拍照，识别会自动开始。")
@@ -888,14 +902,10 @@ def render_recognize_tab(cfg: Dict[str, object], detector: FaceDetector,
         fingerprint = image_fingerprint(image)
         if st.session_state.rec_last_fp != fingerprint:
             st.session_state.rec_last_fp = fingerprint
-            st.session_state.rec_history.append({
-                "时刻": datetime.now().strftime("%H:%M:%S"),
-                "识别结果": main.name,
-                "相似度": round(main.similarity, 4),
-                "阈值": round(threshold, 2),
-                "是否陌生人": (not main.is_known),
-                "人脸数": len(faces),
-            })
+            st.session_state.rec_history.append(
+                _make_record(main.name, main.similarity, threshold,
+                             not main.is_known, len(faces))
+            )
 
     col_img, col_res = st.columns([1.1, 1])
     with col_img:
@@ -911,7 +921,7 @@ def render_recognize_tab(cfg: Dict[str, object], detector: FaceDetector,
 
         # ---- 判定可靠性提示：别只看绝对值，要看"和阈值/第二名的距离" ----
         margin = main.margin
-        if main.is_known and not (margin != margin):        # margin 为 NaN 时跳过
+        if main.is_known and not math.isnan(margin):   # margin 为 NaN 时跳过
             if margin < 0.05:
                 st.warning(
                     f"⚠️ **本次判定可能不可靠**：第一名与第二名只差 {margin:.4f}。\n\n"
@@ -960,7 +970,7 @@ def render_recognize_tab(cfg: Dict[str, object], detector: FaceDetector,
         cols = st.columns(min(5, len(crops)))
         for idx, crop in enumerate(crops):
             with cols[idx % len(cols)]:
-                st.image(crop, caption=f"人脸 {idx + 1} 160x160", width="stretch")
+                show_image(crop, caption=f"人脸 {idx + 1} 160x160")
 
     # ---- 摄像头识别记录（做"连续拍多张看稳定性"的演示很好用）----
     if source.startswith("📷") and st.session_state.rec_history:
@@ -1019,7 +1029,7 @@ def render_database_tab(cfg: Dict[str, object], db: FaceDatabase) -> None:
             for idx, path in enumerate(person.image_paths[:12]):
                 with cols[idx % len(cols)]:
                     try:
-                        st.image(Image.open(path), width="stretch")
+                        show_image(Image.open(path))
                     except Exception:
                         st.caption("图片缺失")
 
@@ -1168,7 +1178,7 @@ def render_burst_mode(cfg: Dict[str, object], detector: FaceDetector,
                            key=f"burst_camera_{st.session_state.burst_shot_seq}")
 
     if shot is not None:
-        image = to_pil(shot)
+        image = to_rgb_pil(shot)
         fingerprint = image_fingerprint(image)
         # 同一张照片只记一次（否则拖滑块、点按钮都会重复计数）
         if st.session_state.burst_last_fp != fingerprint:
@@ -1178,23 +1188,17 @@ def render_burst_mode(cfg: Dict[str, object], detector: FaceDetector,
                 flash("error", "这一张没有检测到人脸，请靠近镜头、正对光源后重拍。")
                 st.session_state.burst_last_canvas = image
                 st.session_state.burst_last_label = "未检测到人脸"
-                st.session_state.burst_records.append({
-                    "时刻": datetime.now().strftime("%H:%M:%S"),
-                    "识别结果": "未检测到人脸", "相似度": 0.0, "阈值": round(float(cfg["threshold"]), 2),
-                    "是否陌生人": None, "人脸数": 0,
-                })
+                st.session_state.burst_records.append(
+                    _make_record("未检测到人脸", 0.0, cfg["threshold"], None, 0)
+                )
             else:
                 main = outcome["results"][0]
                 st.session_state.burst_last_canvas = outcome["canvas"]
                 st.session_state.burst_last_label = f"{main.name}  相似度 {main.similarity:.4f}"
-                st.session_state.burst_records.append({
-                    "时刻": datetime.now().strftime("%H:%M:%S"),
-                    "识别结果": main.name,
-                    "相似度": round(main.similarity, 4),
-                    "阈值": round(float(cfg["threshold"]), 2),
-                    "是否陌生人": (not main.is_known),
-                    "人脸数": len(outcome["faces"]),
-                })
+                st.session_state.burst_records.append(
+                    _make_record(main.name, main.similarity, cfg["threshold"],
+                                 not main.is_known, len(outcome["faces"]))
+                )
                 if main.is_known:
                     st.session_state.burst_ok += 1
                 else:

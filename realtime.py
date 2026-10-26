@@ -41,49 +41,21 @@ import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw
 
-# ---- 可选依赖检测：缺失时降级为提示，不影响其它功能 ----
-try:
-    import cv2
-except Exception:  # pragma: no cover
-    cv2 = None
-
-try:
-    import av
-    from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
-
-    try:  # 0.4x 之后 mode 要求传 WebRtcMode 枚举，老版本才接受字符串
-        from streamlit_webrtc import WebRtcMode
-
-        _MODE_SENDRECV: object = WebRtcMode.SENDRECV
-    except Exception:  # pragma: no cover
-        _MODE_SENDRECV = "sendrecv"
-
-    WEBRTC_AVAILABLE = True
-except Exception:  # pragma: no cover
-    av = None
-    RTCConfiguration = None
-    VideoProcessorBase = object
-    webrtc_streamer = None
-    _MODE_SENDRECV = "sendrecv"
-    WEBRTC_AVAILABLE = False
-
-# 只需要一个 STUN 服务器即可在局域网/本机建立连接
-_RTC_CONFIG = (
-    RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-    if WEBRTC_AVAILABLE else None
+# ---- 可选依赖（cv2 / streamlit-webrtc / av）统一由 webrtc_common 探测，缺失时降级 ----
+from webrtc_common import (
+    av,
+    cv2,
+    VideoProcessorBase,
+    webrtc_streamer,
+    WEBRTC_AVAILABLE,
+    _MODE_SENDRECV,
+    _RTC_CONFIG,
 )
 
 
 # ===========================================================================
 # 公共工具：画框、人脸库缓存、识别
 # ===========================================================================
-def _load_font(size: int = 20):
-    """取一个能显示中文的字体（复用 face_detector 里的候选字体逻辑）。"""
-    from face_detector import load_font
-
-    return load_font(size)
-
-
 def annotate_bgr(
     frame_bgr: np.ndarray,
     boxes: Sequence[np.ndarray],
@@ -99,10 +71,12 @@ def annotate_bgr(
     if not boxes:
         return frame_bgr
 
+    from face_detector import load_font
+
     img_rgb = frame_bgr[:, :, ::-1].copy()
     pil = Image.fromarray(np.ascontiguousarray(img_rgb))
     draw = ImageDraw.Draw(pil)
-    font = _load_font(20)
+    font = load_font(20)
 
     for box, text, is_unknown in zip(boxes, labels, unknown):
         color = (255, 64, 64) if is_unknown else (0, 255, 0)
@@ -135,7 +109,8 @@ def load_gallery(db_path: str, face_dir: str, ttl: float = 5.0,
         db = FaceDatabase(db_path=db_path, face_dir=face_dir, auto_load=True)
         data = db.get_gallery()
     except Exception:
-        data = (holder.get("data") or ([], np.zeros((0, 512), dtype=np.float32)))[0:2]
+        # 读库失败时退回上一份缓存（首次则退回空库），保证视频流不会中断
+        data = holder.get("data") or ([], np.zeros((0, 512), dtype=np.float32))
     holder["data"] = data
     holder["at"] = now
     return data
@@ -160,24 +135,20 @@ def _recognize_faces(
         return [], [], []
 
     faces = faces[: max(1, int(max_faces))]
+    boxes = [face.box for face in faces]
+
+    # 人脸库为空时不必提特征，直接把每张脸标成"人脸库为空"
+    if not names or gallery.shape[0] == 0:
+        return boxes, ["人脸库为空"] * len(faces), [True] * len(faces)
+
     crops = [detector.crop(pil_image, f) for f in faces]
     embeddings = extractor.extract_batch(crops, batch_size=8)
 
-    boxes: List[np.ndarray] = []
     labels: List[str] = []
     unknown: List[bool] = []
-
-    if not names or gallery.shape[0] == 0:
-        for face in faces:
-            boxes.append(face.box)
-            labels.append("人脸库为空")
-            unknown.append(True)
-        return boxes, labels, unknown
-
-    for face, emb in zip(faces, embeddings):
+    for emb in embeddings:
         result = identify(emb, names, gallery, threshold=float(threshold), top_k=3,
                           aggregate=aggregate, mean_topk=int(mean_topk))
-        boxes.append(face.box)
         if result.is_known:
             labels.append(f"{result.name} {result.similarity:.2f}")
             unknown.append(False)

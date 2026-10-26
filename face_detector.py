@@ -31,10 +31,9 @@ MTCNN（Multi-task Cascaded Convolutional Networks，多任务级联卷积网络
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -42,11 +41,11 @@ from PIL import Image, ImageDraw, ImageFont
 import torch
 from facenet_pytorch import MTCNN
 
-# ---------------------------------------------------------------------------
-# 类型别名与默认参数
-# ---------------------------------------------------------------------------
-ImageLike = Union[str, os.PathLike, Image.Image, np.ndarray]
+from image_utils import ImageLike, to_rgb_pil
 
+# ---------------------------------------------------------------------------
+# 默认参数
+# ---------------------------------------------------------------------------
 DEFAULT_IMAGE_SIZE = 160   # FaceNet 系列模型的输入边长
 DEFAULT_MARGIN = 20        # 裁剪时四周额外扩出的边距（原图像素）
 DEFAULT_MIN_FACE_SIZE = 40  # 小于该尺寸的人脸会被 MTCNN 忽略
@@ -169,22 +168,7 @@ class FaceDetector:
     @staticmethod
     def to_pil(image: ImageLike) -> Image.Image:
         """把 路径 / PIL / numpy 统一转换成 RGB 的 PIL.Image。"""
-        if isinstance(image, Image.Image):
-            img = image
-        elif isinstance(image, np.ndarray):
-            arr = image
-            if arr.ndim == 2:                       # 灰度图 -> RGB
-                arr = np.stack([arr] * 3, axis=-1)
-            if arr.ndim == 3 and arr.shape[2] == 4:  # RGBA -> RGB
-                arr = arr[:, :, :3]
-            if arr.dtype != np.uint8:               # 浮点图（0~1 或 0~255）转成 uint8
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-            img = Image.fromarray(np.ascontiguousarray(arr), mode="RGB")
-        else:
-            img = Image.open(image)                  # 文件路径
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        return img
+        return to_rgb_pil(image)
 
     @staticmethod
     def _clip_box(box: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -356,7 +340,7 @@ class FaceDetector:
         """
         canvas = self.to_pil(image).copy()
         draw = ImageDraw.Draw(canvas)
-        font = _load_font(max(14, int(min(canvas.size) / 35)))
+        font = load_font(max(14, int(min(canvas.size) / 35)))
 
         for idx, face in enumerate(faces):
             is_unknown = bool(unknown_flags[idx]) if unknown_flags is not None and idx < len(unknown_flags) else False
@@ -388,7 +372,7 @@ class FaceDetector:
                 f"align={self.align}, device='{self.device}')")
 
 
-def _load_font(size: int) -> ImageFont.FreeTypeFont:
+def load_font(size: int) -> ImageFont.FreeTypeFont:
     """加载一个能显示中文的字体；找不到就退回 Pillow 默认字体（中文会显示为方块）。"""
     for path in _CJK_FONT_CANDIDATES:
         try:
@@ -400,10 +384,6 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default(size=size)
     except Exception:
         return ImageFont.load_default()
-
-
-# 公开别名：realtime.py 等模块需要用它来绘制中文姓名
-load_font = _load_font
 
 
 # ---------------------------------------------------------------------------

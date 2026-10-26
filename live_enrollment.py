@@ -29,7 +29,7 @@ live_enrollment.py
 from __future__ import annotations
 
 import functools
-import os
+import math
 import threading
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -38,17 +38,20 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
-from enrollment_guide import (
-    PLAN,
-    PLAN_BY_KEY,
-    REQUIRED_KEYS,
-    YAW_TOO_MUCH,
-    appearance_of,
-    assess_quality,
-    coverage,
+import enrollment_guide as guide   # 角度阈值/引导语都从这里取，避免重复定义
+
+# ---- 可选依赖（cv2 / streamlit-webrtc / av）统一由 webrtc_common 探测，缺失时降级 ----
+from webrtc_common import (
+    av,
+    cv2,
+    VideoProcessorBase,
+    webrtc_streamer,
+    WEBRTC_AVAILABLE,
+    _MODE_SENDRECV,
+    _RTC_CONFIG,
 )
 
-import enrollment_guide as guide   # 角度阈值/引导语都从这里取，避免重复定义
+from ui_utils import show_image
 
 
 def _window_text(key: str) -> str:
@@ -86,40 +89,6 @@ def _ascii_advice(advice: str, target_key: Optional[str]) -> str:
         return "angle OK"
     return f"next: {target_key}" if target_key else "keep going"
 
-try:
-    import cv2
-except Exception:  # pragma: no cover
-    cv2 = None
-
-# ---- 浏览器 WebRTC 实时录入所需依赖（可选）----
-try:
-    import av
-    from streamlit_webrtc import (
-        RTCConfiguration,
-        VideoProcessorBase,
-        webrtc_streamer,
-    )
-
-    try:                       # 0.4x 起 mode 要传 WebRtcMode 枚举
-        from streamlit_webrtc import WebRtcMode
-
-        _MODE_SENDRECV: object = WebRtcMode.SENDRECV
-    except Exception:          # pragma: no cover
-        _MODE_SENDRECV = "sendrecv"
-
-    WEBRTC_AVAILABLE = True
-except Exception:  # pragma: no cover
-    av = None
-    RTCConfiguration = None
-    VideoProcessorBase = object
-    webrtc_streamer = None
-    _MODE_SENDRECV = "sendrecv"
-    WEBRTC_AVAILABLE = False
-
-_RTC_CONFIG = (
-    RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-    if WEBRTC_AVAILABLE else None
-)
 
 DEFAULT_REFRESH = 0.4          # 每 0.4 秒抓一帧
 DEFAULT_MIN_SCORE = 55         # 质量分下限
@@ -202,7 +171,7 @@ class LiveEnrollmentSession:
         face = faces[0]
         # 带上"本人正视基线"和"参考正面照外观"（如果已经标定过），
         # 抬头/低头的角度判定都会更准
-        record = assess_quality(pil, face, nose_baseline=self.nose_baseline,
+        record = guide.assess_quality(pil, face, nose_baseline=self.nose_baseline,
                                 reference=self.reference)
         pose = record.get("pose", {}) or {}
         slot = record["slot"]
@@ -216,10 +185,10 @@ class LiveEnrollmentSession:
                 and abs(yaw_deg) <= guide.YAW_FRONT_DEG
                 and abs(pitch_deg) <= guide.PITCH_TOL_DEG):
             baseline = float(pose.get("nose_ratio_corrected", float("nan")))
-            if baseline == baseline and 0.20 <= baseline <= 0.95:      # 非 NaN 且在合理范围
+            if not math.isnan(baseline) and 0.20 <= baseline <= 0.95:  # 在合理范围内
                 self.nose_baseline = baseline
         if self.reference is None and slot == "front":
-            self.reference = appearance_of(record)
+            self.reference = guide.appearance_of(record)
 
         # 当前应该去补哪个机位 —— 引导语就针对它说"还差几度"
         target = self.next_target()
@@ -294,26 +263,26 @@ class LiveEnrollmentSession:
     def items(self) -> List[dict]:
         """按采集计划的顺序（正面→左→右→抬头→低头→…）返回已采用的帧。"""
         ordered: List[dict] = []
-        for plan in PLAN:
+        for plan in guide.PLAN:
             bucket = self.best.get(plan["key"], [])
             ordered.extend(sorted(bucket, key=lambda it: -it["score"]))
         return ordered
 
     def coverage(self) -> dict:
-        return coverage(self.analyses())
+        return guide.coverage(self.analyses())
 
     def is_complete(self) -> bool:
         return bool(self.coverage()["complete"])
 
     def next_target(self) -> Optional[dict]:
         key = self.coverage().get("next_key")
-        return PLAN_BY_KEY.get(key) if key else None
+        return guide.PLAN_BY_KEY.get(key) if key else None
 
     def hud_lines(self) -> List[str]:
         """给预览画面用的一行行提示（用 ASCII：cv2.putText 画不了中文）。"""
         cov = self.coverage()
         lines = [f"captured={self.attempts}  accepted={len(self.items())}  "
-                 f"core={len(cov['filled_core'])}/{len(REQUIRED_KEYS)}"]
+                 f"core={len(cov['filled_core'])}/{len(guide.REQUIRED_KEYS)}"]
         if self.last_pose_line:              # 实测角度 + "再往哪边几度"的英文提示
             lines.append(self.last_pose_line)
         target = self.next_target()
@@ -585,7 +554,7 @@ def render_webrtc_enrollment(detector=None, per_slot: int = DEFAULT_PER_SLOT,
         （踩过坑：文案从"集齐 5 个"改成"集齐 7 个"后 startswith 就匹配不上了，
         默认条件静默失效，变成"每张都要 80 分"）。
         """
-        cov_now = coverage([it["analysis"] for it in best_items])
+        cov_now = guide.coverage([it["analysis"] for it in best_items])
         if not cov_now["complete"]:
             return False, ""
         scores = [float(it["score"]) for it in best_items]
@@ -650,7 +619,7 @@ def render_webrtc_enrollment(detector=None, per_slot: int = DEFAULT_PER_SLOT,
         ok, why = _meets_rule(best_items)
 
         col_a, col_b, col_c, col_d = st.columns(4)
-        col_a.metric("已收录机位（核心）", f"{len(cov_now['filled_core'])}/{len(REQUIRED_KEYS)}")
+        col_a.metric("已收录机位（核心）", f"{len(cov_now['filled_core'])}/{len(guide.REQUIRED_KEYS)}")
         col_b.metric("已收录帧", len(best_items))
         col_c.metric("分析帧数", session.attempts)
         col_d.metric("实时帧率", f"{processor.fps:.1f}")
@@ -688,13 +657,8 @@ def render_webrtc_enrollment(detector=None, per_slot: int = DEFAULT_PER_SLOT,
             for idx, img in enumerate(frozen_frames):
                 rec = frozen_analysis[idx] if idx < len(frozen_analysis) else {}
                 with cols[idx % 5]:
-                    try:
-                        st.image(img, caption=f"{rec.get('slot_title', '')}"
-                                              f"｜{rec.get('score', 0):.0f} 分", width="stretch")
-                    except TypeError:                       # pragma: no cover
-                        st.image(img, caption=f"{rec.get('slot_title', '')}"
-                                              f"｜{rec.get('score', 0):.0f} 分",
-                                 use_container_width=True)
+                    show_image(img, caption=f"{rec.get('slot_title', '')}"
+                                           f"｜{rec.get('score', 0):.0f} 分")
             if guide_renderer is not None:
                 guide_renderer(frozen_analysis)
 

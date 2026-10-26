@@ -219,28 +219,53 @@ def verify_pair(embedding_a: np.ndarray, embedding_b: np.ndarray,
 # ---------------------------------------------------------------------------
 # 阈值评估工具（写实验报告 / 答辩加分项）
 # ---------------------------------------------------------------------------
+def _pairwise_similarities(
+    embeddings: np.ndarray,
+    names: Sequence[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """算出所有特征两两之间的余弦相似度，以及每一对是否属于同一个人。
+
+    返回 (sims, same)：
+        sims : 一维 float64 数组，只含上三角（i<j），即每一条特征只与它后面的比一次
+        same : 与 sims 等长的布尔数组，True 表示这一对是同一个人
+
+    实现上用"先逐行归一化、再一次矩阵乘法"，等价于逐对算余弦相似度，
+    但快一个数量级（大库时差异更明显）。
+    """
+    emb = np.asarray(embeddings, dtype=np.float32)
+    n = len(emb)
+    if n < 2:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=bool)
+
+    norms = np.linalg.norm(emb, axis=1, keepdims=True)
+    unit = emb / np.maximum(norms, 1e-10)
+    sim_matrix = unit @ unit.T
+
+    upper = np.triu_indices(n, k=1)          # 只取上三角，避免自己比自己
+    sims = sim_matrix[upper].astype(np.float64)
+    name_arr = np.asarray(list(names))
+    same = name_arr[upper[0]] == name_arr[upper[1]]
+    return sims, same
+
+
+def _stat(values: np.ndarray) -> Dict[str, float]:
+    """一组相似度的统计量（数量 / 均值 / 最小 / 最大）。"""
+    if values.size == 0:
+        return {"数量": 0, "均值": float("nan"), "最小": float("nan"), "最大": float("nan")}
+    return {"数量": int(values.size), "均值": float(np.mean(values)),
+            "最小": float(np.min(values)), "最大": float(np.max(values))}
+
+
 def similarity_stats(embeddings: np.ndarray, names: Sequence[str]) -> Dict[str, float]:
     """统计类内（同一人）与类间（不同人）相似度分布，用于说明阈值怎么选。
 
     返回：类内均值/最小/最大、类间均值/最大、以及二者之间的"最佳分割点"建议值。
     """
-    emb = np.asarray(embeddings, dtype=np.float32)
-    names = list(names)
-    intra, inter = [], []
-    for i in range(len(emb)):
-        for j in range(i + 1, len(emb)):
-            sim = cosine_similarity(emb[i], emb[j])
-            (intra if names[i] == names[j] else inter).append(sim)
+    sims, same = _pairwise_similarities(embeddings, names)
+    intra_stat, inter_stat = _stat(sims[same]), _stat(sims[~same])
 
-    def _stat(values: List[float]) -> Dict[str, float]:
-        if not values:
-            return {"数量": 0, "均值": float("nan"), "最小": float("nan"), "最大": float("nan")}
-        return {"数量": len(values), "均值": float(np.mean(values)),
-                "最小": float(np.min(values)), "最大": float(np.max(values))}
-
-    intra_stat, inter_stat = _stat(intra), _stat(inter)
     suggestion = float("nan")
-    if intra and inter:
+    if intra_stat["数量"] and inter_stat["数量"]:
         # 简单策略：取"类内最小值"与"类间最大值"的中点作为建议阈值
         suggestion = float((intra_stat["最小"] + inter_stat["最大"]) / 2.0)
     return {"类内相似度": intra_stat, "类间相似度": inter_stat, "建议阈值": suggestion}
@@ -253,24 +278,26 @@ def find_best_threshold(
 ) -> Dict[str, float]:
     """在 [0,1] 上扫描阈值，按准确率给出最佳阈值（用于报告中画"阈值-准确率"曲线）。"""
     emb = np.asarray(embeddings, dtype=np.float32)
-    names = list(names)
     if len(emb) < 2:
         return {"最佳阈值": DEFAULT_THRESHOLD, "最佳准确率": float("nan")}
 
-    pairs = []
-    for i in range(len(emb)):
-        for j in range(i + 1, len(emb)):
-            pairs.append((cosine_similarity(emb[i], emb[j]), names[i] == names[j]))
-    if not pairs:
+    sims, same = _pairwise_similarities(emb, names)
+    if sims.size == 0:
         return {"最佳阈值": DEFAULT_THRESHOLD, "最佳准确率": float("nan")}
 
-    best_t, best_acc = DEFAULT_THRESHOLD, -1.0
-    for t in np.linspace(0.0, 1.0, int(steps)):
-        correct = sum(1 for sim, same in pairs if (sim >= t) == same)
-        acc = correct / len(pairs)
-        if acc > best_acc:
-            best_acc, best_t = acc, float(t)
-    return {"最佳阈值": float(best_t), "最佳准确率": float(best_acc)}
+    # 判定规则 (sim >= t) == same，即：
+    #   同人一对要 sim >= t 才算对；异人一对要 sim < t 才算对。
+    # 把同人对、异人对分别排序后用二分查找计数，就不必对每个阈值再扫一遍全部组合。
+    same_sims = np.sort(sims[same])
+    diff_sims = np.sort(sims[~same])
+    thresholds = np.linspace(0.0, 1.0, int(steps))
+    hit = (same_sims.size - np.searchsorted(same_sims, thresholds, side="left")) \
+        + np.searchsorted(diff_sims, thresholds, side="left")
+    accs = hit / float(sims.size)
+
+    # argmax 取第一个最大值，与原先"严格大于才更新"的写法等价
+    best = int(np.argmax(accs))
+    return {"最佳阈值": float(thresholds[best]), "最佳准确率": float(accs[best])}
 
 
 # ---------------------------------------------------------------------------

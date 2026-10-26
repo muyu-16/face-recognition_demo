@@ -28,10 +28,12 @@ enrollment_guide.py
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image
+
+from image_utils import to_rgb_pil
 
 # ---------------------------------------------------------------------------
 # 采集计划：core 为必做机位（正好 5 张，满足作业"至少 5 张"的要求且有覆盖），
@@ -73,7 +75,6 @@ OPTIONAL_KEYS: List[str] = [item["key"] for item in PLAN if item["group"] == "ex
 # 人脸占比（人脸框面积 / 整图面积）的经验阈值
 FACE_RATIO_TOO_FAR = 0.04      # 小于它 = 脸太小（离太远 / 图太大）
 FACE_RATIO_NEAR = 0.30         # 大于它才算"靠近镜头"（笔记本自拍常在 0.15~0.30）
-FACE_RATIO_OK = 0.06           # 达到它就算"够大、可用于注册"
 
 # ---------------------------------------------------------------------------
 # 姿态：比值 ↔ 角度 的换算（用真实注册照标定出来的，见 README）
@@ -283,22 +284,6 @@ def _sharpness(gray: np.ndarray) -> float:
         return float((gx ** 2 + gy ** 2).var())
 
 
-def _to_pil(image) -> Image.Image:
-    """把 PIL / ndarray / 路径统一转成 RGB 的 PIL.Image。"""
-    if isinstance(image, Image.Image):
-        return image.convert("RGB") if image.mode != "RGB" else image
-    if isinstance(image, np.ndarray):
-        arr = image
-        if arr.ndim == 2:
-            arr = np.stack([arr] * 3, axis=-1)
-        if arr.ndim == 3 and arr.shape[2] == 4:
-            arr = arr[:, :, :3]
-        if arr.dtype != np.uint8:
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
-        return Image.fromarray(np.ascontiguousarray(arr)).convert("RGB")
-    return Image.open(image).convert("RGB")
-
-
 def _resolve_nose_baseline(nose_baseline: Optional[float],
                            reference: Optional[Dict[str, float]]) -> Optional[float]:
     """决定这次评估用哪个"正视鼻-眼比"基线。
@@ -320,7 +305,7 @@ def _resolve_nose_baseline(nose_baseline: Optional[float],
             base = float(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return None
-        if base == base and 0.20 <= base <= 0.95:      # 非 NaN 且在合理范围
+        if not math.isnan(base) and 0.20 <= base <= 0.95:   # 非 NaN 且在合理范围
             return base
     return None
 
@@ -343,7 +328,7 @@ def assess_quality(image, face, nose_baseline: Optional[float] = None,
           "score": 0~100, "slot": 机位 key, "slot_title": 机位名
         }
     """
-    pil = _to_pil(image)
+    pil = to_rgb_pil(image)
     width, height = pil.size
     box = np.asarray(face.box, dtype=np.float32)
     box_area = max(0.0, float(box[2] - box[0])) * max(0.0, float(box[3] - box[1]))

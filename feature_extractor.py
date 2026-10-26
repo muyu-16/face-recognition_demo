@@ -45,7 +45,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from face_detector import resolve_device
+from face_detector import DEFAULT_IMAGE_SIZE, resolve_device
+from image_utils import to_rgb_array
+from similarity import l2_normalize
 
 # FaceNet 固定标准化参数：把 0~255 的像素映射到约 [-1, 1]
 FACENET_MEAN = 127.5
@@ -54,8 +56,6 @@ FACENET_STD = 128.0
 # ImageNet 归一化参数（torchvision 官方值）
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-
-DEFAULT_IMAGE_SIZE = 160
 
 # ---------------------------------------------------------------------------
 # 预训练权重的缓存目录
@@ -239,16 +239,8 @@ class FeatureExtractor:
         if len(faces) == 0:
             return torch.zeros(0, 3, self.image_size, self.image_size, device=self.device)
 
-        arrs = []
-        for face in faces:
-            arr = np.asarray(face)
-            if arr.ndim == 2:                     # 灰度兜底
-                arr = np.stack([arr] * 3, axis=-1)
-            if arr.shape[2] == 4:                 # RGBA 兜底
-                arr = arr[:, :, :3]
-            if arr.dtype != np.uint8:
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-            arrs.append(arr)
+        # 统一走 image_utils.to_rgb_array：灰度补通道、RGBA 截 alpha、非 uint8 截断
+        arrs = [to_rgb_array(face) for face in faces]
 
         x = torch.from_numpy(np.stack(arrs, axis=0)).permute(0, 3, 1, 2).float()  # NCHW
 
@@ -269,13 +261,6 @@ class FeatureExtractor:
             x = (x - mean) / std
 
         return x.to(self.device)
-
-    @staticmethod
-    def l2_normalize_array(x: np.ndarray, eps: float = 1e-10) -> np.ndarray:
-        """对 numpy 向量做 L2 归一化（逐行）。"""
-        x = np.asarray(x, dtype=np.float32)
-        norm = np.linalg.norm(x, axis=-1, keepdims=True)
-        return x / np.maximum(norm, eps)
 
     # ------------------------------------------------------------------
     # 特征提取
@@ -302,7 +287,7 @@ class FeatureExtractor:
             feat = self.model(x)                       # (B, D)
             feat = feat.detach().cpu().numpy().astype(np.float32)
             if self.l2_normalize:
-                feat = self.l2_normalize_array(feat)
+                feat = l2_normalize(feat, axis=-1)
             outputs.append(feat)
             if progress_callback is not None:
                 progress_callback(min(start + len(chunk), total), total)
